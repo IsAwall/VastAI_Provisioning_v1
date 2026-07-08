@@ -83,7 +83,6 @@ pip_install() {
     echo "[pip] first attempt failed, retrying with --break-system-packages"
     "$PY" -m pip install --break-system-packages "$@"
 }
-
 # ---------------------------------------------------------------------------
 # System packages the script itself needs (image-layer binaries vanish on a
 # fresh instance even though /workspace persists, so re-check every boot).
@@ -162,7 +161,6 @@ fi
 export HF_HOME="${WORKSPACE:-/workspace}/.cache/huggingface"
 export HF_HUB_ENABLE_HF_TRANSFER=0        # make sure the deprecated path is off
 mkdir -p "$HF_HOME"
-
 # HF_XET_HIGH_PERFORMANCE raises concurrency bounds + buffer sizes; HF recommends
 # it only for boxes with >=64 GB RAM. Enable adaptively.
 mem_gb="$(free -g 2>/dev/null | awk '/^Mem:/{print $2}')"
@@ -244,7 +242,6 @@ dl_hf() {
     local want have=0
     want="$(remote_size "$check_url")"
     [[ -f "$dest" ]] && have="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
-
     if [[ -f "$dest" ]]; then
         if [[ -n "$want" ]] && (( have == want )); then
             echo "[model] $name complete (${have} bytes), skipping"; return 0
@@ -295,4 +292,106 @@ dl_aria2() {
                   --max-file-not-found=2 -d "$dir" -o "$name" "$url"; then
             break
         fi
-        echo "[mod
+        echo "[model] attempt ${n} failed for $name"; (( n++ )); sleep 5
+    done
+    have=0; [[ -f "$dest" ]] && have="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
+    [[ -f "$dest" ]] || { echo "[model] DOWNLOAD FAILED: $name"; return 0; }
+    if [[ -n "$want" ]] && (( have != want )); then
+        echo "[model] WARNING: $name incomplete (${have}/${want}) -- kept for resume"; return 0
+    fi
+    echo "[model] $name OK (${have} bytes)"
+}
+
+# ---------------------------------------------------------------------------
+# Model manifest
+#   HF  entries:  hf  | dest_dir | dest_filename | repo_id            | repo_path
+#   URL entries:  url | dest_dir | dest_filename | https://...              (non-HF)
+# ---------------------------------------------------------------------------
+DM="${COMFY}/models/diffusion_models"
+LORA="${COMFY}/models/loras"
+VAE="${COMFY}/models/vae"
+TE="${COMFY}/models/text_encoders"
+
+MODELS=(
+    # --- Diffusion models (Wan 2.2 I2V 14B, fp16 ~26 GiB each) ---
+    "hf|$DM|wan2.2_i2v_high_noise_14B_fp16.safetensors|Comfy-Org/Wan_2.2_ComfyUI_Repackaged|split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp16.safetensors"
+    "hf|$DM|wan2.2_i2v_low_noise_14B_fp16.safetensors|Comfy-Org/Wan_2.2_ComfyUI_Repackaged|split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp16.safetensors"
+    #   fp8 alternative (~half the size + disk; swap in if your workflows allow):
+    # "hf|$DM|wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors|Comfy-Org/Wan_2.2_ComfyUI_Repackaged|split_files/diffusion_models/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"
+    # "hf|$DM|wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors|Comfy-Org/Wan_2.2_ComfyUI_Repackaged|split_files/diffusion_models/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors"
+
+    # --- SVI / Lightx2v LoRAs ---
+    "hf|$LORA|SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors|Kijai/WanVideo_comfy|LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_HIGH_lora_rank_128_fp16.safetensors"
+    "hf|$LORA|SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors|Kijai/WanVideo_comfy|LoRAs/Stable-Video-Infinity/v2.0/SVI_v2_PRO_Wan2.2-I2V-A14B_LOW_lora_rank_128_fp16.safetensors"
+    "hf|$LORA|lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors|Kijai/WanVideo_comfy|Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank128_bf16.safetensors"
+    # --- VAE ---
+    "hf|$VAE|wan_2.1_vae.safetensors|Comfy-Org/Wan_2.2_ComfyUI_Repackaged|split_files/vae/wan_2.1_vae.safetensors"
+
+    # --- Text encoder ---
+    "hf|$TE|umt5_xxl_fp8_e4m3fn_scaled.safetensors|chatpig/encoder|umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+)
+
+# Install aria2 only if the manifest actually has non-HF entries.
+if printf '%s\n' "${MODELS[@]}" | grep -q '^url|'; then
+    ensure_pkg aria2c aria2
+fi
+
+# ---------------------------------------------------------------------------
+# Disk pre-flight: sum bytes still to fetch vs free space; skip the model phase
+# (loudly) rather than half-fill the disk and corrupt a model.
+# ---------------------------------------------------------------------------
+preflight_disk() {
+    local need=0 kind a b c d url dest have want
+    for entry in "${MODELS[@]}"; do
+        IFS='|' read -r kind a b c d <<< "$entry"
+        case "$kind" in
+            hf)  url="$(hf_resolve_url "$c" "$d")"; dest="${a}/${b}" ;;
+            url) url="$c"; dest="${a}/${b}" ;;
+            *)   continue ;;
+        esac
+        have=0; [[ -f "$dest" ]] && have="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
+        want="$(remote_size "$url")"
+        [[ -z "$want" ]] && continue
+        (( want > have )) && need=$(( need + want - have ))
+    done
+
+    mkdir -p "$DM"
+    local avail; avail="$(df -PB1 "$DM" | awk 'NR==2{print $4}')"
+    local margin=$(( 5 * 1024*1024*1024 ))
+    local h_need h_avail
+    h_need="$(numfmt --to=iec "$need"  2>/dev/null || echo "${need} B")"
+    h_avail="$(numfmt --to=iec "$avail" 2>/dev/null || echo "${avail} B")"
+    echo "[provisioning] models still to fetch: ${h_need};  free on models FS: ${h_avail}"
+
+    if (( need + margin > avail )); then
+        echo "[provisioning] !!! INSUFFICIENT DISK: need ~${h_need} + 5GiB headroom, have ${h_avail}"
+        echo "[provisioning] !!! Skipping model downloads. Resize the instance disk and reboot,"
+        echo "[provisioning] !!! or switch to the fp8 Wan variants in the manifest (~half the size)."
+        return 1
+    fi
+    # Soft warning: Xet's chunk cache needs transient headroom during the run.
+    if (( avail - need < 15 * 1024*1024*1024 )); then
+        echo "[provisioning] NOTE: tight headroom after download (< ~15GiB). Xet's chunk cache"
+        echo "[provisioning] NOTE: uses transient space; consider a bigger disk or the fp8 models."
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Fetch models
+# ---------------------------------------------------------------------------
+echo "=================== MODELS ==================="
+if preflight_disk; then
+    for entry in "${MODELS[@]}"; do
+        IFS='|' read -r kind a b c d <<< "$entry"
+        case "$kind" in
+            hf)  dl_hf    "$a" "$b" "$c" "$d" ;;
+            url) dl_aria2 "$a" "$b" "$c"      ;;
+            *)   echo "[model] unknown manifest kind: '$kind' in: $entry" ;;
+        esac
+    done
+else
+    echo "[provisioning] model phase skipped (see disk warning above)"
+fi
+
+echo "=================== PROVISIONING COMPLETE ==================="
