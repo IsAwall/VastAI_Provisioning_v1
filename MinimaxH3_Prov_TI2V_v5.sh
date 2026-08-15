@@ -606,6 +606,8 @@ NODES=(
     # Frame interpolation. Pulls the TensorRT stack; builds its engine on
     # first use, per GPU architecture. See the header note.
     "https://github.com/huchukato/ComfyUI-RIFE-TensorRT-Auto"
+    # Native Context Loop for extending videos
+    "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Contex-Loop"
 )
 [[ "$WANT_TURBO" == "1" ]] && NODES+=( "https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo" )
 
