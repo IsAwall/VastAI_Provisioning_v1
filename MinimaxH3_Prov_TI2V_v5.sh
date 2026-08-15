@@ -910,6 +910,9 @@ MODELS=(
     # === LoRAs via HuggingFace ===========================================
     "hf|$LORA|H3_K3NK_Side_Deepthroat.safetensors|Ghiladden/7800|7800.safetensors"
 
+    # === Workflows =======================================================
+    "hf|$WF|Mike MiniMax H3 I2V Context Extend v1.json|Ghiladden/7800|Mike MiniMax H3 I2V Context Extend v1.json"
+
 )
 
 # === TURBO LoRA -- Kijai's 4-step kijai_minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16 =======
