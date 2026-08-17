@@ -217,10 +217,10 @@ echo "########## provisioning run (MiniMax H3 I2V v4): $(date -u '+%Y-%m-%d %H:%
 COMFY="${WORKSPACE:-/workspace}/ComfyUI"
 NODES_DIR="${COMFY}/custom_nodes"
 
-COMFY_UPDATE="${COMFY_UPDATE:-1}"
-NODE_UPDATE="${NODE_UPDATE:-1}"
-WANT_TURBO="${WANT_TURBO:-1}"
-WANT_SEEDVR2="${WANT_SEEDVR2:-1}"
+COMFY_UPDATE="1"
+NODE_UPDATE="1"
+WANT_TURBO="0"
+WANT_SEEDVR2="0"
 echo "[provisioning] comfy_update=${COMFY_UPDATE} node_update=${NODE_UPDATE} turbo=${WANT_TURBO} seedvr2=${WANT_SEEDVR2}"
 
 [[ -f /opt/ai-dock/etc/environment.sh ]] && source /opt/ai-dock/etc/environment.sh
@@ -908,10 +908,10 @@ MODELS=(
     "hf|$VAE|minimax_h3_audio_vae_fp32.safetensors|Comfy-Org/MiniMax-H3|vae/minimax_h3_audio_vae_fp32.safetensors"
     
     # === LoRAs via HuggingFace ===========================================
-    "hf|$LORA|H3_K3NK_Side_Deepthroat.safetensors|Ghiladden/7800|7800.safetensors"
+    "hf|$LORA|H3_K3NK_Side_Deepthroat.safetensors|Ghiladden/7801|7800.safetensors"
 
     # === Workflows =======================================================
-    "hf|$WF|Mike MiniMax H3 I2V Context Extend v1.json|Ghiladden/7800|Mike MiniMax H3 I2V Context Extend v1.json"
+    "hf|$WF|Mike MiniMax H3 I2V Context Extend v1.json|Ghiladden/7801|Mike MiniMax H3 I2V Context Extend v1.json"
 
 )
 
