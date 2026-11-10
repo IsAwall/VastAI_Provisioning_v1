@@ -22,14 +22,15 @@
 #   PURGE_LEGACY_SEEDVR2=1      delete the old third-party SeedVR2 pack + weights
 #   FIX_FLASH_ATTN=0            skip the half-installed flash-attn guard
 #   INSTALL_SAGE=1              install SageAttention (drafts only)
-#   HF_DL_BACKEND=xet|aria2     HF download path (default xet). aria2 = plain
-#                               16-connection HTTPS; use it if Xet is slow/stalls
+#   HF_DL_BACKEND=auto|xet|aria2  HF download path (default auto: xet, falling
+#                               back to 16-connection aria2 if xet fails/stalls/crawls)
+#   HF_STALL_SECS=180 HF_MIN_MIBS=60 HF_GRACE_SECS=300   auto-fallback thresholds
 #
 # v12 CHANGES
 #   - hf_xet is upgraded every boot (was: only installed if missing).
 #   - huggingface_hub / hf_xet versions are logged.
 #   - Each HF download logs elapsed time and average MiB/s.
-#   - HF_DL_BACKEND=aria2 fallback that skips Xet entirely.
+#   - HF_DL_BACKEND=auto (default): xet with automatic aria2 fallback.
 #   - Xet downloads print a [progress] line (size, MiB/s, ETA) every
 #     HF_PROGRESS_SECS seconds (default 30); tqdm bars are suppressed.
 #
@@ -545,8 +546,11 @@ for p in ("huggingface_hub", "hf_xet"):
     try:    print("[hf] %s %s" % (p, m.version(p)))
     except Exception: print("[hf] %s absent" % p)
 PYEOF
-# HF_DL_BACKEND=xet (default) | aria2  -- aria2 = 16-connection plain HTTPS, bypasses Xet
-HF_DL_BACKEND="${HF_DL_BACKEND:-xet}"
+# HF_DL_BACKEND=auto (default) | xet | aria2
+#   auto  = xet under a watchdog; falls back to aria2 if xet fails, stalls for
+#           HF_STALL_SECS (180), or averages < HF_MIN_MIBS (60) after HF_GRACE_SECS (300)
+#   xet   = xet only, never falls back       aria2 = skip xet entirely
+HF_DL_BACKEND="${HF_DL_BACKEND:-auto}"
 echo "[hf] download backend: ${HF_DL_BACKEND}"
 
 export HF_HOME="${WORKSPACE:-/workspace}/.cache/huggingface"
@@ -604,6 +608,69 @@ except Exception:
     traceback.print_exc(); sys.exit(1)
 PYEOF
 
+# Bytes allocated under a dir (blocks, not apparent size: sparse files can't fake it).
+dir_bytes() { local n; n="$(du -sB1 "$1" 2>/dev/null | awk '{print $1}')"; printf '%s' "${n:-0}"; }
+hsize()     { numfmt --to=iec "$1" 2>/dev/null || printf '%s' "$1"; }
+
+# dl_aria2 <dir> <name> <url>
+dl_aria2() {
+    aria2c -x 16 -s 16 -k 10M --file-allocation=none --summary-interval=30 \
+           --continue=true --auto-file-renaming=false --allow-overwrite=true \
+           --max-tries=5 --retry-wait=5 --connect-timeout=30 --timeout=600 \
+           "${ARIA_AUTH[@]}" -d "$1" -o "$2" "$3"
+}
+
+# dl_xet <dir> <name> <repo> <rpath> <dest> <want>
+# Runs hf_hub_download under a watchdog. Returns 0 ok, 1 failed, 3 aborted (slow/stalled).
+dl_xet() {
+    local dir="$1" name="$2" repo="$3" rpath="$4" dest="$5" want="$6"
+    local stage="${dir}/.hf_stage" flag="/tmp/xet_abort.$$"
+    local step="${HF_PROGRESS_SECS:-30}" stall_max="${HF_STALL_SECS:-180}"
+    local grace="${HF_GRACE_SECS:-300}" min_mibs="${HF_MIN_MIBS:-60}"
+    local base pid mon rc
+    rm -f "$flag"; mkdir -p "$stage"
+    base="$(dir_bytes "$stage")"
+
+    HF_HUB_DISABLE_PROGRESS_BARS=1 "$PY" "$HF_GET" "$repo" "$rpath" "$dest" & pid=$!
+
+    (
+        local prev="$base" now rate eta t=0 stalled=0 avg
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep "$step"; t=$(( t + step ))
+            kill -0 "$pid" 2>/dev/null || break
+            now="$(dir_bytes "$stage")"
+            if (( now < prev )); then
+                echo "[progress] ${name}  stage SHRANK $(hsize "$prev") -> $(hsize "$now") (retry/temp cleanup)"
+                prev="$now"; continue
+            fi
+            rate=$(( (now - prev) / step / 1048576 ))
+            avg=$(( (now - base) / t / 1048576 ))
+            (( now > prev )) && stalled=0 || stalled=$(( stalled + step ))
+            eta="?"
+            [[ -n "$want" ]] && (( avg > 0 && want > now )) && eta="$(( (want - now) / (avg * 1048576) / 60 ))m"
+            echo "[progress] ${name}  $(hsize "$now") / $( [[ -n "$want" ]] && hsize "$want" || echo '?')  now ~${rate} MiB/s  avg ~${avg} MiB/s  eta ${eta}"
+            prev="$now"
+            if [[ "$HF_DL_BACKEND" == "auto" ]]; then
+                if (( stalled >= stall_max )); then
+                    echo "no bytes for ${stalled}s" > "$flag"
+                elif (( t >= grace && avg < min_mibs )); then
+                    echo "avg ${avg} MiB/s < ${min_mibs} after ${t}s" > "$flag"
+                fi
+                if [[ -f "$flag" ]]; then
+                    echo "[progress] ${name}  xet too slow ($(cat "$flag")) -> aborting"
+                    kill "$pid" 2>/dev/null; sleep 2; kill -9 "$pid" 2>/dev/null
+                    break
+                fi
+            fi
+        done
+    ) & mon=$!
+
+    wait "$pid"; rc=$?
+    kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+    if [[ -f "$flag" ]]; then rm -f "$flag"; return 3; fi
+    (( rc == 0 )) && return 0 || return 1
+}
+
 dl_hf() {
     local dir="$1" name="$2" repo="$3" rpath="$4"
     local dest="${dir}/${name}"
@@ -613,7 +680,7 @@ dl_hf() {
     local want have=0
     want="$(remote_size "$check_url")"
     [[ -f "$dest" ]] && have="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
-    if [[ -f "$dest" ]]; then
+    if [[ -f "$dest" && ! -f "${dest}.aria2" ]]; then
         if [[ -n "$want" ]] && (( have == want )); then
             echo "[model] $name complete, skipping"; return 0
         elif [[ -n "$want" ]]; then
@@ -624,47 +691,36 @@ dl_hf() {
         fi
     fi
 
-    echo "[model] downloading $name (${repo}) via ${HF_DL_BACKEND}"
-    local t0=$SECONDS ok=1
-    if [[ "$HF_DL_BACKEND" == "aria2" ]]; then
-        aria2c -x 16 -s 16 -k 10M --file-allocation=none --summary-interval=30 \
-               --continue=true --auto-file-renaming=false --allow-overwrite=true \
-               --max-tries=5 --retry-wait=5 --connect-timeout=30 --timeout=600 \
-               "${ARIA_AUTH[@]}" -d "$dir" -o "$name" "$check_url" || ok=0
+    local t0=$SECONDS ok=0 used="$HF_DL_BACKEND" rc
+    if [[ "$HF_DL_BACKEND" == "aria2" || -f "${dest}.aria2" ]]; then
+        # forced aria2, or an aria2 partial from an earlier boot -> resume it
+        used="aria2"
+        echo "[model] downloading $name (${repo}) via aria2"
+        dl_aria2 "$dir" "$name" "$check_url" && ok=1
     else
-        # Xet's own progress bar is sparse and \r-mangled in a tee'd log, so
-        # watch bytes landing in the stage dir instead. du counts allocated
-        # blocks, not apparent size, so a pre-sized sparse file can't fake it.
-        local stage="${dir}/.hf_stage" mon
-        (
-            local prev=0 now step=${HF_PROGRESS_SECS:-30}
-            while sleep "$step"; do
-                now="$(du -sB1 "$stage" 2>/dev/null | awk '{print $1}')"; now="${now:-0}"
-                local rate=$(( (now - prev) / step / 1048576 )) eta="?"
-                if [[ -n "$want" ]] && (( rate > 0 && want > now )); then
-                    eta="$(( (want - now) / (rate * 1048576) / 60 ))m"
-                fi
-                printf '[progress] %s  %s / %s  ~%s MiB/s  eta %s\n' "$name" \
-                    "$(numfmt --to=iec "$now" 2>/dev/null || echo "$now")" \
-                    "$( [[ -n "$want" ]] && numfmt --to=iec "$want" 2>/dev/null || echo '?')" \
-                    "$rate" "$eta"
-                prev=$now
-            done
-        ) & mon=$!
-        HF_HUB_DISABLE_PROGRESS_BARS=1 "$PY" "$HF_GET" "$repo" "$rpath" "$dest" || ok=0
-        kill "$mon" 2>/dev/null; wait "$mon" 2>/dev/null
+        echo "[model] downloading $name (${repo}) via xet (backend=${HF_DL_BACKEND})"
+        dl_xet "$dir" "$name" "$repo" "$rpath" "$dest" "$want"; rc=$?
+        if (( rc == 0 )); then
+            ok=1; used="xet"
+        elif [[ "$HF_DL_BACKEND" == "auto" ]]; then
+            (( rc == 3 )) || echo "[model] $name: xet FAILED -> falling back"
+            echo "[model] $name: switching to aria2 (discarding xet partial)"
+            rm -rf "${dir}/.hf_stage"; rm -f "$dest"
+            used="xet->aria2"
+            dl_aria2 "$dir" "$name" "$check_url" && ok=1
+        fi
     fi
+
     if (( ok )); then
         have=0; [[ -f "$dest" ]] && have="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
         local secs=$(( SECONDS - t0 )); (( secs > 0 )) || secs=1
-        local rate=$(( have / secs / 1048576 ))
         if [[ -n "$want" ]] && (( have != want )); then
             echo "[model] WARNING: $name size ${have} != expected ${want}"
         else
-            echo "[model] $name OK (${have} bytes, ${secs}s, ~${rate} MiB/s)"
+            echo "[model] $name OK (${have} bytes, ${secs}s, ~$(( have / secs / 1048576 )) MiB/s, ${used})"
         fi
     else
-        echo "[model] DOWNLOAD FAILED: $name (retries next boot)"
+        echo "[model] DOWNLOAD FAILED: $name via ${used} (retries next boot)"
     fi
 }
 
